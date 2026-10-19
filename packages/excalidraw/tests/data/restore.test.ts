@@ -3,6 +3,7 @@ import { vi } from "vitest";
 
 import {
   COLOR_PALETTE,
+  DEFAULT_ELEMENT_PROPS,
   DEFAULT_FONT_SIZE,
   DEFAULT_SIDEBAR,
   FONT_FAMILY,
@@ -23,6 +24,7 @@ import type { LocalPoint } from "@excalidraw/math";
 import type {
   ExcalidrawStickyNoteElement,
   ExcalidrawArrowElement,
+  ExcalidrawElbowArrowElement,
   ExcalidrawElement,
   ExcalidrawFreeDrawElement,
   ExcalidrawLinearElement,
@@ -123,6 +125,80 @@ describe("restoreElements", () => {
     expect(restore.restoreElements(null, null)).toStrictEqual([]);
   });
 
+  it.each([
+    ["without options", undefined],
+    [
+      "with import options",
+      { repairBindings: true, deleteInvisibleElements: true },
+    ],
+  ] as const)(
+    "should skip malformed entries and keep the rest of the scene (%s)",
+    (_, opts) => {
+      const container = API.createElement({
+        type: "rectangle",
+        id: "container",
+        boundElements: [{ type: "text", id: "label" }],
+      });
+      const label = API.createElement({
+        type: "text",
+        id: "label",
+        containerId: container.id,
+      });
+
+      const restoredElements = restore.restoreElements(
+        [
+          null,
+          undefined,
+          0,
+          "",
+          "rectangle",
+          true,
+          // arrays are objects, but not elements
+          Object.assign([], { type: "rectangle", id: "array" }),
+          {},
+          { id: "typeless" },
+          { type: 5, id: "non-string-type" },
+          container,
+          null,
+          label,
+        ] as any[],
+        null,
+        opts,
+      );
+
+      expect(restoredElements.map((element) => element.id)).toEqual([
+        container.id,
+        label.id,
+      ]);
+      expect(restoredElements[0].boundElements).toEqual([
+        { type: "text", id: label.id },
+      ]);
+      expect((restoredElements[1] as ExcalidrawTextElement).containerId).toBe(
+        container.id,
+      );
+    },
+  );
+
+  it.each([
+    ["without options", undefined],
+    [
+      "with import options",
+      { repairBindings: true, deleteInvisibleElements: true },
+    ],
+  ] as const)(
+    "should return empty array when elements are not an array or all malformed (%s)",
+    (_, opts) => {
+      const rect = API.createElement({ type: "rectangle" });
+
+      expect(
+        restore.restoreElements({ 0: rect, length: 1 } as any, null, opts),
+      ).toEqual([]);
+      expect(
+        restore.restoreElements([null, undefined, 1] as any[], null, opts),
+      ).toEqual([]);
+    },
+  );
+
   it("should not call isInvisiblySmallElement when element is a selection element", () => {
     const selectionEl = { type: "selection" } as ExcalidrawElement;
     const restoreElements = restore.restoreElements([selectionEl], null);
@@ -200,6 +276,7 @@ describe("restoreElements", () => {
     });
 
     textElement.text = null;
+    textElement.originalText = null;
     textElement.font = "10 unknown";
 
     expect(textElement.isDeleted).toBe(false);
@@ -1013,6 +1090,704 @@ describe("restoreElements", () => {
     );
     expect(restoredElements[0].version).toBe(modified_rectangle_2.version + 1);
   });
+
+  it("should not throw checking invisibility of a linear element without points", () => {
+    const rect = API.createElement({ type: "rectangle", id: "rect" });
+    const line = { type: "line", id: "line", x: 0, y: 0 } as any;
+
+    const restoredElements = restore.restoreElements([line, rect], null, {
+      repairBindings: true,
+      deleteInvisibleElements: true,
+    });
+
+    expect(
+      restoredElements.map(({ id, isDeleted }) => ({ id, isDeleted })),
+    ).toEqual([
+      { id: "line", isDeleted: true },
+      { id: "rect", isDeleted: false },
+    ]);
+  });
+
+  it("should rebuild linear elements with fewer than 2 valid points from their size", () => {
+    const base = { x: 0, y: 0, width: 50, height: 50 };
+    const elements = [
+      { ...base, type: "line", id: "line", points: [[0, 0]] },
+      {
+        ...base,
+        type: "line",
+        id: "zero-line",
+        points: [[0, 0]],
+        width: 0,
+        height: 0,
+      },
+      { ...base, type: "arrow", id: "arrow", points: [[0, 0]] },
+      { ...base, type: "freedraw", id: "freedraw", points: [[0, 0]] },
+      { ...base, type: "line", id: "pointless-line" },
+      {
+        ...base,
+        type: "line",
+        id: "valid-line",
+        points: [
+          [0, 0],
+          [50, 50],
+        ],
+      },
+    ];
+
+    const restoredElements = restore.restoreElements(elements as any[], null, {
+      deleteInvisibleElements: true,
+    });
+
+    expect(
+      restoredElements.map(({ id, isDeleted }) => ({ id, isDeleted })),
+    ).toEqual([
+      { id: "line", isDeleted: false },
+      // nothing to rebuild from
+      { id: "zero-line", isDeleted: true },
+      { id: "arrow", isDeleted: false },
+      // strokes can't be rebuilt from the size
+      { id: "freedraw", isDeleted: true },
+      { id: "pointless-line", isDeleted: false },
+      { id: "valid-line", isDeleted: false },
+    ]);
+    for (const element of [
+      restoredElements[0],
+      restoredElements[2],
+      restoredElements[4],
+    ]) {
+      expect((element as ExcalidrawLinearElement).points).toEqual([
+        [0, 0],
+        [50, 50],
+      ]);
+    }
+  });
+
+  it("should repair malformed boundElements entries", () => {
+    const nullEntry = API.createElement({ type: "rectangle", id: "a" });
+    const stringValue = API.createElement({ type: "rectangle", id: "b" });
+    const mixed = API.createElement({ type: "rectangle", id: "c" });
+    const label = API.createElement({
+      type: "text",
+      id: "label",
+      containerId: "c",
+    });
+    (nullEntry as any).boundElements = [null];
+    (stringValue as any).boundElements = "abc";
+    (mixed as any).boundElements = [
+      null,
+      { id: 5, type: "text" },
+      { type: "text", id: "label" },
+    ];
+
+    const restoredElements = restore.restoreElements(
+      [nullEntry, stringValue, mixed, label],
+      null,
+      { repairBindings: true, deleteInvisibleElements: true },
+    );
+
+    expect(
+      restoredElements.map(({ id, boundElements }) => ({ id, boundElements })),
+    ).toEqual([
+      { id: "a", boundElements: [] },
+      { id: "b", boundElements: [] },
+      { id: "c", boundElements: [{ type: "text", id: "label" }] },
+      { id: "label", boundElements: [] },
+    ]);
+  });
+
+  it("should keep text element if refreshing its dimensions fails", () => {
+    const rect = API.createElement({ type: "rectangle", id: "rect" });
+    const text = API.createElement({ type: "text", id: "text" });
+    const consoleError = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => {});
+    const spy = vi
+      .spyOn(sizeHelpers, "refreshTextDimensions")
+      .mockImplementationOnce(() => {
+        throw new Error("FORBIDDEN!");
+      });
+
+    try {
+      expect(
+        restore
+          .restoreElements([rect, text], null, {
+            repairBindings: true,
+            refreshDimensions: true,
+          })
+          .map((element) => element.id),
+      ).toEqual(["rect", "text"]);
+      expect(consoleError).toHaveBeenCalledWith(
+        "Error refreshing text dimensions:",
+        expect.any(Error),
+      );
+    } finally {
+      spy.mockRestore();
+      consoleError.mockRestore();
+    }
+  });
+
+  it("should restore id-less elements without resolving references to them", () => {
+    const idless1 = { type: "rectangle", x: 0, y: 0, width: 10, height: 10 };
+    const idless2 = { type: "rectangle", x: 0, y: 0, width: 10, height: 10 };
+    const arrow = API.createElement({
+      type: "arrow",
+      id: "arrow",
+      points: [pointFrom<LocalPoint>(0, 0), pointFrom<LocalPoint>(100, 0)],
+    });
+    // legacy (v1) binding referencing an id that doesn't exist
+    (arrow as any).startBinding = { elementId: undefined, focus: 0, gap: 0 };
+
+    const restoredElements = restore.restoreElements(
+      [idless1, idless2, arrow] as any[],
+      null,
+    );
+
+    expect(restoredElements.length).toBe(3);
+    expect(typeof restoredElements[0].id).toBe("string");
+    expect(typeof restoredElements[1].id).toBe("string");
+    expect(restoredElements[0].id).not.toBe(restoredElements[1].id);
+    expect(
+      (restoredElements[2] as ExcalidrawArrowElement).startBinding,
+    ).toBeNull();
+  });
+});
+
+describe("repairing malformed elements", () => {
+  const restoreImported = (elements: unknown[]) =>
+    restore.restoreElements(elements as any[], null, {
+      repairBindings: true,
+      deleteInvisibleElements: true,
+    });
+
+  it("should infer a missing type from the element's properties", () => {
+    const restoredElements = restoreImported([
+      { id: "text", text: "hi" },
+      { id: "image", fileId: "file", width: 10, height: 10 },
+      {
+        id: "freedraw",
+        points: [
+          [0, 0],
+          [10, 10],
+        ],
+        pressures: [0.5, 0.5],
+      },
+      {
+        id: "arrow",
+        points: [
+          [0, 0],
+          [10, 10],
+        ],
+        endArrowhead: "arrow",
+      },
+      {
+        id: "line",
+        points: [
+          [0, 0],
+          [10, 10],
+        ],
+      },
+      { id: "rectangle", type: null, width: 10, height: 10 },
+      { id: "cased", type: " Ellipse ", width: 10, height: 10 },
+    ]);
+
+    expect(
+      restoredElements.map(({ id, type, isDeleted }) => ({
+        id,
+        type,
+        isDeleted,
+      })),
+    ).toEqual([
+      { id: "text", type: "text", isDeleted: false },
+      { id: "image", type: "image", isDeleted: false },
+      { id: "freedraw", type: "freedraw", isDeleted: false },
+      { id: "arrow", type: "arrow", isDeleted: false },
+      { id: "line", type: "line", isDeleted: false },
+      { id: "rectangle", type: "rectangle", isDeleted: false },
+      { id: "cased", type: "ellipse", isDeleted: false },
+    ]);
+  });
+
+  it("should drop elements of unknown type or without any hint of one", () => {
+    const rect = API.createElement({ type: "rectangle", id: "rect" });
+
+    expect(
+      restoreImported([
+        // may come from a newer version, so don't turn it into something else
+        { id: "future", type: "hexagon", width: 10, height: 10 },
+        { id: "hintless", x: 10 },
+        rect,
+      ]).map((element) => element.id),
+    ).toEqual(["rect"]);
+  });
+
+  it("should measure text elements without a size", () => {
+    const [text] = restoreImported([
+      { type: "text", id: "text", text: "hi", x: 0, y: 0 },
+    ]);
+
+    expect(text.isDeleted).toBe(false);
+    expect(text.width).toBeGreaterThan(0);
+    expect(text.height).toBeGreaterThan(0);
+  });
+
+  it("should recover text from originalText", () => {
+    const [text] = restoreImported([
+      { type: "text", id: "text", text: null, originalText: "hi" },
+    ]) as ExcalidrawTextElement[];
+
+    expect(text).toEqual(
+      expect.objectContaining({
+        text: "hi",
+        originalText: "hi",
+        isDeleted: false,
+      }),
+    );
+  });
+
+  it("should coerce malformed values instead of dropping them", () => {
+    const [rect] = restoreImported([
+      {
+        type: "rectangle",
+        id: "rect",
+        x: "10",
+        y: null,
+        width: "30px",
+        height: 40,
+        opacity: 300,
+        angle: "abc",
+        strokeWidth: -1,
+        strokeStyle: "wavy",
+        fillStyle: 5,
+        strokeColor: 5,
+        groupIds: [1, null, "group"],
+        frameId: {},
+        roundness: 3,
+        isDeleted: "no",
+        locked: 1,
+        link: 5,
+        version: -2,
+        // valid, so that syncing indices doesn't bump the version
+        index: "a0",
+      },
+    ]);
+
+    expect(rect).toEqual(
+      expect.objectContaining({
+        x: 10,
+        y: 0,
+        width: 30,
+        height: 40,
+        opacity: 100,
+        angle: 0,
+        strokeWidth: DEFAULT_ELEMENT_PROPS.strokeWidth,
+        strokeStyle: DEFAULT_ELEMENT_PROPS.strokeStyle,
+        fillStyle: DEFAULT_ELEMENT_PROPS.fillStyle,
+        strokeColor: DEFAULT_ELEMENT_PROPS.strokeColor,
+        groupIds: ["1", "group"],
+        frameId: null,
+        roundness: { type: 3 },
+        isDeleted: false,
+        locked: false,
+        link: null,
+        version: 1,
+      }),
+    );
+  });
+
+  it("should resolve references to numeric ids", () => {
+    const [container, text] = restoreImported([
+      {
+        type: "rectangle",
+        id: 1,
+        width: 100,
+        height: 100,
+        boundElements: [{ id: 2 }],
+      },
+      { type: "text", id: 2, text: "hi", containerId: 1 },
+    ]) as [ExcalidrawElement, ExcalidrawTextElement];
+
+    expect(container.id).toBe("1");
+    expect(container.boundElements).toEqual([{ id: "2", type: "text" }]);
+    expect(text.id).toBe("2");
+    expect(text.containerId).toBe("1");
+  });
+
+  it("should correct boundElements types from the bound elements", () => {
+    const [container] = restoreImported([
+      {
+        type: "rectangle",
+        id: "container",
+        width: 100,
+        height: 100,
+        // wrong and missing types, a bare id, and a freedraw that can't bind
+        boundElements: [
+          { id: "label", type: "arrow" },
+          { id: "arrow" },
+          "arrow2",
+          { id: "freedraw", type: "arrow" },
+        ],
+      },
+      { type: "text", id: "label", text: "hi", containerId: "container" },
+      {
+        type: "arrow",
+        id: "arrow",
+        points: [
+          [0, 0],
+          [10, 10],
+        ],
+      },
+      {
+        type: "arrow",
+        id: "arrow2",
+        points: [
+          [0, 0],
+          [10, 10],
+        ],
+      },
+      {
+        type: "freedraw",
+        id: "freedraw",
+        points: [
+          [0, 0],
+          [10, 10],
+        ],
+      },
+    ]);
+
+    expect(container.boundElements).toEqual([
+      { id: "label", type: "text" },
+      { id: "arrow", type: "arrow" },
+      { id: "arrow2", type: "arrow" },
+    ]);
+  });
+
+  it("should restore legacy boundElementIds that aren't an array", () => {
+    const [container] = restoreImported([
+      {
+        type: "rectangle",
+        id: "container",
+        width: 100,
+        height: 100,
+        boundElementIds: "arrow",
+      },
+      {
+        type: "arrow",
+        id: "arrow",
+        points: [
+          [0, 0],
+          [10, 10],
+        ],
+      },
+    ]);
+
+    expect(container.boundElements).toEqual([{ id: "arrow", type: "arrow" }]);
+  });
+
+  it("should unbind text from elements that can't contain it", () => {
+    const [, text] = restoreImported([
+      {
+        type: "freedraw",
+        id: "freedraw",
+        points: [
+          [0, 0],
+          [10, 10],
+        ],
+      },
+      { type: "text", id: "text", text: "hi", containerId: "freedraw" },
+    ]) as [ExcalidrawElement, ExcalidrawTextElement];
+
+    expect(text.containerId).toBe(null);
+  });
+
+  it("should remove frame membership pointing to an element that isn't a frame", () => {
+    const [, rect] = restoreImported([
+      { type: "ellipse", id: "ellipse", width: 10, height: 10 },
+      {
+        type: "rectangle",
+        id: "rect",
+        width: 10,
+        height: 10,
+        frameId: "ellipse",
+      },
+    ]);
+
+    expect(rect.frameId).toBe(null);
+  });
+
+  it("should restore { x, y } and numeric string points", () => {
+    const [line] = restoreImported([
+      {
+        type: "line",
+        id: "line",
+        points: [{ x: 0, y: 0 }, ["10", "20"]],
+      },
+    ]) as ExcalidrawLinearElement[];
+
+    expect(line.points).toEqual([
+      [0, 0],
+      [10, 20],
+    ]);
+    expect(line.width).toBe(10);
+    expect(line.height).toBe(20);
+  });
+
+  it("should rebuild a linear element from its only non-origin point", () => {
+    const [line] = restoreImported([
+      { type: "line", id: "line", points: [[30, 40]] },
+    ]) as ExcalidrawLinearElement[];
+
+    expect(line.isDeleted).toBe(false);
+    expect(line.points).toEqual([
+      [0, 0],
+      [30, 40],
+    ]);
+  });
+
+  it("should restore an arrow binding given as a bare element id", () => {
+    const [, arrow] = restoreImported([
+      { type: "rectangle", id: "rect", x: 0, y: 0, width: 100, height: 100 },
+      {
+        type: "arrow",
+        id: "arrow",
+        x: 50,
+        y: 50,
+        points: [
+          [0, 0],
+          [200, 0],
+        ],
+        startBinding: "rect",
+        endBinding: 5,
+      },
+    ]) as [ExcalidrawElement, ExcalidrawArrowElement];
+
+    expect(arrow.startBinding).toEqual(
+      expect.objectContaining({ elementId: "rect" }),
+    );
+    expect(arrow.endBinding).toBe(null);
+  });
+
+  it("should keep pressures that don't quite match the points", () => {
+    const [freedraw] = restoreImported([
+      {
+        type: "freedraw",
+        id: "freedraw",
+        points: [
+          [0, 0],
+          [10, 10],
+          [20, 20],
+        ],
+        pressures: [0.2, 0.8],
+        simulatePressure: false,
+      },
+    ]) as ExcalidrawFreeDrawElement[];
+
+    expect(freedraw.simulatePressure).toBe(false);
+    expect(freedraw.pressures).toEqual([0.2, 0.8, 0.5]);
+  });
+
+  it("should keep pressures aligned when skipping invalid points", () => {
+    const [freedraw] = restoreImported([
+      {
+        type: "freedraw",
+        id: "freedraw",
+        points: [[0, 0], "invalid", [20, 20]],
+        pressures: [0.2, 0.4, 0.8],
+        simulatePressure: false,
+      },
+    ]) as ExcalidrawFreeDrawElement[];
+
+    expect(freedraw.points).toEqual([
+      [0, 0],
+      [20, 20],
+    ]);
+    expect(freedraw.pressures).toEqual([0.2, 0.8]);
+  });
+
+  it("should simulate pressure when there are no pressures", () => {
+    const [freedraw] = restoreImported([
+      {
+        type: "freedraw",
+        id: "freedraw",
+        points: [
+          [0, 0],
+          [10, 10],
+        ],
+        simulatePressure: false,
+      },
+    ]) as ExcalidrawFreeDrawElement[];
+
+    expect(freedraw.simulatePressure).toBe(true);
+    expect(freedraw.pressures).toEqual([]);
+  });
+
+  it("should keep pressures matching the points", () => {
+    const [freedraw] = restoreImported([
+      {
+        type: "freedraw",
+        id: "freedraw",
+        points: [
+          [0, 0],
+          [10, 10],
+        ],
+        pressures: [0.2, 0.8],
+      },
+    ]) as ExcalidrawFreeDrawElement[];
+
+    expect(freedraw.simulatePressure).toBe(false);
+    expect(freedraw.pressures).toEqual([0.2, 0.8]);
+  });
+
+  it("should not throw on a non-string legacy font", () => {
+    const [text] = restoreImported([
+      { type: "text", id: "text", text: "hi", font: 5 },
+    ]) as ExcalidrawTextElement[];
+
+    expect(text.fontSize).toBe(DEFAULT_FONT_SIZE);
+  });
+
+  it("should keep text when measuring it fails", () => {
+    const measureText = vi
+      .spyOn(sizeHelpers, "measureText")
+      .mockImplementation(() => {
+        throw new Error("no canvas");
+      });
+    const consoleError = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => {});
+
+    try {
+      const [text] = restore.restoreElements(
+        [{ type: "text", id: "text", text: "hi" }] as any[],
+        null,
+      ) as ExcalidrawTextElement[];
+
+      expect(text).toEqual(expect.objectContaining({ id: "text", text: "hi" }));
+    } finally {
+      measureText.mockRestore();
+      consoleError.mockRestore();
+    }
+  });
+
+  it("should restore a numeric string font family", () => {
+    const [text] = restoreImported([
+      { type: "text", id: "text", text: "hi", fontFamily: "3" },
+    ]) as ExcalidrawTextElement[];
+
+    expect(text.fontFamily).toBe(3);
+  });
+
+  it("should infer the type of an element with an empty type", () => {
+    const [text] = restoreImported([
+      { type: " ", id: "text", text: "hi" },
+    ]) as ExcalidrawTextElement[];
+
+    expect(text.type).toBe("text");
+  });
+
+  it("should never restore a version below 1", () => {
+    const [rect] = restore.restoreElements(
+      [
+        {
+          type: "rectangle",
+          id: "rect",
+          index: "a0",
+          width: 10,
+          height: 10,
+          version: 0.3,
+        },
+      ] as any[],
+      null,
+    );
+
+    expect(rect.version).toBe(1);
+  });
+
+  it("should drop out of range, duplicate and unordered fixed segments", () => {
+    const [arrow] = restoreImported([
+      {
+        type: "arrow",
+        id: "arrow",
+        elbowed: true,
+        points: [
+          [0, 0],
+          [50, 0],
+          [50, 50],
+          [100, 50],
+          [100, 100],
+        ],
+        fixedSegments: [
+          { start: [50, 50], end: [100, 50], index: 3 },
+          { start: [50, 0], end: [50, 50], index: 2 },
+          { start: [50, 0], end: [50, 50], index: 2 },
+          { start: [0, 0], end: [0, 0], index: 50 },
+          { start: [0, 0], end: [0, 0], index: 0 },
+        ],
+      },
+    ]) as ExcalidrawElbowArrowElement[];
+
+    expect(arrow.fixedSegments?.map((segment) => segment.index)).toEqual([
+      2, 3,
+    ]);
+  });
+
+  it("should correct bound element types without repairing bindings", () => {
+    const [container] = restore.restoreElements(
+      [
+        {
+          type: "rectangle",
+          id: "rect",
+          width: 100,
+          height: 100,
+          boundElements: [{ id: "label", type: "Label" }, "arrow"],
+        },
+        { type: "text", id: "label", text: "hi", containerId: "rect" },
+        {
+          type: "arrow",
+          id: "arrow",
+          points: [
+            [0, 0],
+            [10, 10],
+          ],
+        },
+      ] as any[],
+      null,
+    );
+
+    expect(container.boundElements).toEqual([
+      { id: "label", type: "text" },
+      { id: "arrow", type: "arrow" },
+    ]);
+  });
+
+  it("should migrate legacy bindings against the restored bound element", () => {
+    const restoreArrow = (rect: Record<string, unknown>) =>
+      restoreImported([
+        { type: "rectangle", id: "rect", ...rect },
+        {
+          type: "arrow",
+          id: "arrow",
+          x: 0,
+          y: 0,
+          points: [
+            [0, 0],
+            [110, 125],
+          ],
+          endBinding: { elementId: "rect", focus: 0, gap: 0 },
+        },
+      ])[1] as ExcalidrawArrowElement;
+
+    const arrow = restoreArrow({
+      x: "100",
+      y: "100",
+      width: "50",
+      height: "50",
+    });
+
+    expect(arrow.endBinding).toEqual(
+      restoreArrow({ x: 100, y: 100, width: 50, height: 50 }).endBinding,
+    );
+    expect(arrow.endBinding?.mode).toBe("inside");
+  });
 });
 
 describe("restoreAppState", () => {
@@ -1264,6 +2039,69 @@ describe("restoreAppState", () => {
   });
 });
 
+describe("restoreLibraryItems", () => {
+  const rect = (id: string) => API.createElement({ type: "rectangle", id });
+
+  it("should skip null and primitive items", () => {
+    const restoredItems = restore.restoreLibraryItems(
+      [
+        null,
+        undefined,
+        0,
+        "item",
+        true,
+        // v1
+        [rect("A")],
+        // v2
+        { id: "item", status: "published", created: 1, elements: [rect("B")] },
+      ] as any,
+      "unpublished",
+    );
+
+    expect(restoredItems).toEqual([
+      {
+        id: expect.any(String),
+        status: "unpublished",
+        created: expect.any(Number),
+        elements: [expect.objectContaining({ id: "A" })],
+      },
+      {
+        id: "item",
+        status: "published",
+        created: 1,
+        elements: [expect.objectContaining({ id: "B" })],
+      },
+    ]);
+  });
+
+  it("should skip v2 items with malformed elements", () => {
+    const restoredItems = restore.restoreLibraryItems(
+      [
+        { id: "missing" },
+        { id: "null", elements: null },
+        { id: "string", elements: "abc" },
+        { id: "object", elements: { 0: rect("X"), length: 1 } },
+        { id: "malformed", elements: [null, 1, "abc", {}] },
+        { id: "mixed", elements: [null, rect("A")] },
+      ] as any,
+      "unpublished",
+    );
+
+    expect(restoredItems).toEqual([
+      expect.objectContaining({
+        id: "mixed",
+        elements: [expect.objectContaining({ id: "A" })],
+      }),
+    ]);
+  });
+
+  it("should skip a non-array library", () => {
+    expect(
+      restore.restoreLibraryItems({ 0: [rect("A")] } as any, "unpublished"),
+    ).toEqual([]);
+  });
+});
+
 describe("repairing bindings", () => {
   it.each(["arrow", "rectangle"] as const)(
     "should repair bound %s label order and fractional index",
@@ -1488,6 +2326,8 @@ describe("repairing bindings", () => {
       width: 0,
       height: 0,
     });
+    // a label with text gets measured, so it's only invisible when empty
+    Object.assign(invisibleBoundElement, { text: "", originalText: "" });
 
     const obsoleteBinding = { type: boundElement.type, id: boundElement.id };
     const invisibleBinding = {
