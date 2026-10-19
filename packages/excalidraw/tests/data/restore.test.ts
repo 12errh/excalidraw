@@ -1412,17 +1412,19 @@ describe("repairing malformed elements", () => {
     expect(text.containerId).toBe("1");
   });
 
-  it("should correct boundElements types from the bound elements", () => {
+  it("should drop boundElements entries without a matching type", () => {
     const [container] = restoreImported([
       {
         type: "rectangle",
         id: "container",
         width: 100,
         height: 100,
-        // wrong and missing types, a bare id, and a freedraw that can't bind
+        // a wrong type (re-added from the label's containerId), a missing type,
+        // a bare id, and a freedraw that can't bind
         boundElements: [
           { id: "label", type: "arrow" },
-          { id: "arrow" },
+          { id: "arrow", type: "Arrow" },
+          { id: "arrow2" },
           "arrow2",
           { id: "freedraw", type: "arrow" },
         ],
@@ -1455,10 +1457,40 @@ describe("repairing malformed elements", () => {
     ]);
 
     expect(container.boundElements).toEqual([
-      { id: "label", type: "text" },
       { id: "arrow", type: "arrow" },
-      { id: "arrow2", type: "arrow" },
+      { type: "text", id: "label" },
     ]);
+  });
+
+  it("should not turn free text into a label through an untyped or mistyped entry", () => {
+    const restoredElements = restoreImported([
+      {
+        type: "rectangle",
+        id: "container",
+        width: 100,
+        height: 100,
+        boundElements: [
+          "text1",
+          { id: "text2" },
+          { id: "text3", type: "arrow" },
+        ],
+      },
+      { type: "text", id: "text1", text: "a", x: 200, y: 200 },
+      { type: "text", id: "text2", text: "b", x: 200, y: 300 },
+      { type: "text", id: "text3", text: "c", x: 200, y: 400 },
+    ]);
+
+    expect(
+      restoredElements.map(({ id, boundElements }) => ({ id, boundElements })),
+    ).toEqual([
+      { id: "container", boundElements: [] },
+      { id: "text1", boundElements: [] },
+      { id: "text2", boundElements: [] },
+      { id: "text3", boundElements: [] },
+    ]);
+    for (const text of restoredElements.slice(1)) {
+      expect((text as ExcalidrawTextElement).containerId).toBe(null);
+    }
   });
 
   it("should restore legacy boundElementIds that aren't an array", () => {
@@ -1730,7 +1762,7 @@ describe("repairing malformed elements", () => {
     ]);
   });
 
-  it("should correct bound element types without repairing bindings", () => {
+  it("should drop untyped boundElements entries without repairing bindings", () => {
     const [container] = restore.restoreElements(
       [
         {
@@ -1738,7 +1770,12 @@ describe("repairing malformed elements", () => {
           id: "rect",
           width: 100,
           height: 100,
-          boundElements: [{ id: "label", type: "Label" }, "arrow"],
+          boundElements: [
+            { id: "label", type: "Label" },
+            "arrow",
+            { id: "label", type: " TEXT " },
+            { id: "arrow", type: "Arrow" },
+          ],
         },
         { type: "text", id: "label", text: "hi", containerId: "rect" },
         {
@@ -1787,6 +1824,268 @@ describe("repairing malformed elements", () => {
       restoreArrow({ x: 100, y: 100, width: 50, height: 50 }).endBinding,
     );
     expect(arrow.endBinding?.mode).toBe("inside");
+  });
+
+  it("should migrate legacy bindings of arrows with malformed geometry", () => {
+    const restoreArrow = (arrow: Record<string, unknown>) =>
+      restoreImported([
+        { type: "rectangle", id: "rect", x: 0, y: 0, width: 100, height: 100 },
+        {
+          type: "arrow",
+          id: "arrow",
+          x: 25,
+          y: 25,
+          points: [
+            [0, 0],
+            [200, 0],
+          ],
+          startBinding: "rect",
+          ...arrow,
+        },
+      ])[1] as ExcalidrawArrowElement;
+
+    const arrow = restoreArrow({ angle: "foo" });
+
+    expect(arrow.angle).toBe(0);
+    expect(arrow.startBinding).toEqual(restoreArrow({ angle: 0 }).startBinding);
+    expect(arrow.startBinding).toEqual(
+      expect.objectContaining({ elementId: "rect", mode: "inside" }),
+    );
+    expect(arrow.startBinding?.fixedPoint[0]).toBeCloseTo(0.25);
+    expect(arrow.startBinding?.fixedPoint[1]).toBeCloseTo(0.25);
+  });
+
+  it("should migrate legacy bindings against the element keeping a duplicate id", () => {
+    const [first, second, arrow] = restoreImported([
+      { type: "rectangle", id: "rect", x: 0, y: 0, width: 100, height: 100 },
+      { type: "rectangle", id: "rect", x: 500, y: 0, width: 100, height: 100 },
+      {
+        type: "arrow",
+        id: "arrow",
+        x: 25,
+        y: 25,
+        points: [
+          [0, 0],
+          [200, 0],
+        ],
+        startBinding: { elementId: "rect", focus: 0, gap: 0 },
+      },
+    ]) as [ExcalidrawElement, ExcalidrawElement, ExcalidrawArrowElement];
+
+    expect(first).toEqual(expect.objectContaining({ id: "rect", x: 0 }));
+    expect(second.id).not.toBe("rect");
+    expect(arrow.startBinding).toEqual(
+      expect.objectContaining({ elementId: "rect", mode: "inside" }),
+    );
+    expect(arrow.startBinding?.fixedPoint[0]).toBeCloseTo(0.25);
+  });
+
+  it("should drop empty and unknown arrowheads", () => {
+    const [arrow] = restoreImported([
+      {
+        type: "arrow",
+        id: "arrow",
+        points: [
+          [0, 0],
+          [100, 0],
+        ],
+        startArrowhead: "dot",
+        endArrowhead: "",
+      },
+    ]) as ExcalidrawArrowElement[];
+    const [line] = restoreImported([
+      {
+        type: "line",
+        id: "line",
+        points: [
+          [0, 0],
+          [100, 0],
+        ],
+        startArrowhead: "foo",
+        endArrowhead: "bar",
+      },
+    ]) as ExcalidrawLinearElement[];
+
+    expect(arrow.startArrowhead).toBe("circle");
+    expect(arrow.endArrowhead).toBe(null);
+    expect(line.startArrowhead).toBe(null);
+    expect(line.endArrowhead).toBe("bar");
+  });
+
+  it("should wrap labels without a size to their container", () => {
+    const [container, label] = restore.restoreElements(
+      [
+        {
+          type: "rectangle",
+          id: "rect",
+          x: 0,
+          y: 0,
+          width: 100,
+          height: 100,
+          boundElements: [{ type: "text", id: "label" }],
+        },
+        {
+          type: "text",
+          id: "label",
+          containerId: "rect",
+          text: "lorem ipsum dolor sit amet consectetur adipiscing elit",
+        },
+      ] as any[],
+      null,
+      { deleteInvisibleElements: true },
+    ) as [ExcalidrawElement, ExcalidrawTextElement];
+
+    expect(label.isDeleted).toBe(false);
+    expect(label.text).toContain("\n");
+    expect(label.width).toBeGreaterThan(0);
+    expect(label.width).toBeLessThanOrEqual(
+      sizeHelpers.getBoundTextMaxWidth(container, label),
+    );
+    expect(label.height).toBeGreaterThan(0);
+  });
+
+  it("should fit sticky note labels without a size to their note", () => {
+    const restoredElements = restoreImported([
+      {
+        type: "stickynote",
+        id: "sticky",
+        x: 0,
+        y: 0,
+        width: 250,
+        height: 250,
+        boundElements: [{ type: "text", id: "label" }],
+      },
+      { type: "text", id: "label", text: "hello", containerId: "sticky" },
+    ]);
+    const note = restoredElements.find(
+      (element) => element.id === "sticky",
+    ) as ExcalidrawStickyNoteElement;
+    const label = restoredElements.find(
+      (element) => element.id === "label",
+    ) as ExcalidrawTextElement;
+
+    expect(label.isDeleted).toBe(false);
+    expect(label.width).toBeGreaterThan(0);
+    expect(label.height).toBeGreaterThan(0);
+    expect(label).toEqual(
+      expect.objectContaining(getStickyNoteLayout(note, label).text),
+    );
+  });
+
+  it("should measure text without a size whose container doesn't exist", () => {
+    const [text] = restoreImported([
+      {
+        type: "text",
+        id: "text",
+        text: "abc",
+        x: 10,
+        y: 20,
+        containerId: "missing",
+      },
+    ]) as ExcalidrawTextElement[];
+
+    expect(text).toEqual(
+      expect.objectContaining({
+        isDeleted: false,
+        containerId: null,
+        x: 10,
+        y: 20,
+      }),
+    );
+    expect(text.width).toBeGreaterThan(0);
+    expect(text.height).toBeGreaterThan(0);
+  });
+
+  it("should wrap labels without a size bound only from their container", () => {
+    const [container, label] = restoreImported([
+      {
+        type: "rectangle",
+        id: "rect",
+        x: 0,
+        y: 0,
+        width: 100,
+        height: 100,
+        boundElements: [{ type: "text", id: "label" }],
+      },
+      {
+        type: "text",
+        id: "label",
+        x: 500,
+        y: 500,
+        text: "lorem ipsum dolor sit amet consectetur adipiscing elit",
+      },
+    ]) as [ExcalidrawElement, ExcalidrawTextElement];
+
+    expect(label.containerId).toBe("rect");
+    expect(label.text).toContain("\n");
+    expect(label.width).toBeLessThanOrEqual(
+      sizeHelpers.getBoundTextMaxWidth(container, label),
+    );
+    expect(label.x).toBeGreaterThanOrEqual(container.x);
+    expect(label.x + label.width).toBeLessThanOrEqual(
+      container.x + container.width,
+    );
+  });
+
+  it("should not truncate strings that aren't numbers to their leading number", () => {
+    const [rect] = restoreImported([
+      {
+        type: "rectangle",
+        id: "rect",
+        x: "12 3",
+        width: 10,
+        height: 10,
+        created: "2024-05-01T10:00:00Z",
+        updated: "2024-05-01T10:00:00Z",
+      },
+    ]);
+
+    expect(rect.x).toBe(0);
+    expect(rect.updated).not.toBe(2024);
+    expect((rect as any).created).not.toBe(2024);
+  });
+
+  it("should not detect the line height from the height of wrapped text it doesn't have", () => {
+    const [text] = restoreImported([
+      {
+        type: "text",
+        id: "text",
+        originalText: "a long sentence",
+        height: 50,
+        fontSize: 20,
+        fontFamily: FONT_FAMILY.Virgil,
+      },
+    ]) as ExcalidrawTextElement[];
+
+    expect(text.lineHeight).toBe(getLineHeight(FONT_FAMILY.Virgil));
+  });
+
+  it("should bump the version of invisible linear elements once", () => {
+    const [arrow] = restoreImported([
+      {
+        type: "arrow",
+        id: "arrow",
+        index: "a0",
+        version: 3,
+        x: 0,
+        y: 0,
+        points: [],
+      },
+    ]);
+
+    expect(arrow).toEqual(
+      expect.objectContaining({ isDeleted: true, version: 4 }),
+    );
+  });
+
+  it("should not share points with the input", () => {
+    const point = [10, 10];
+    const [line] = restoreImported([
+      { type: "line", id: "line", points: [[0, 0], point] },
+    ]) as ExcalidrawLinearElement[];
+
+    expect(line.points[1]).toEqual(point);
+    expect(line.points[1]).not.toBe(point);
   });
 });
 

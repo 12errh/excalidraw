@@ -34,7 +34,6 @@ import {
   type StrokeWidthKey,
   isTransparent,
   DEFAULT_ZOOM,
-  getFontString,
   TEXT_ALIGN,
   VERTICAL_ALIGN,
 } from "@excalidraw/common";
@@ -62,7 +61,11 @@ import {
   normalizeStickyNoteFontSize,
   normalizeStickyNoteStrokeColor,
 } from "@excalidraw/element";
-import { getBoundTextElement, getContainerElement } from "@excalidraw/element";
+import {
+  computeBoundTextPosition,
+  getBoundTextElement,
+  getContainerElement,
+} from "@excalidraw/element";
 import { isStickyNoteElement } from "@excalidraw/element";
 import { detectLineHeight } from "@excalidraw/element";
 import {
@@ -76,8 +79,6 @@ import {
   isTextElement,
   isUsingAdaptiveRadius,
 } from "@excalidraw/element";
-
-import { measureText } from "@excalidraw/element";
 
 import {
   normalizeBoundElementsOrder,
@@ -95,6 +96,7 @@ import type { LocalPoint, Radians } from "@excalidraw/math";
 
 import type {
   AnyArrowhead,
+  Arrowhead,
   BindMode,
   BoundElement,
   ElementsMap,
@@ -107,6 +109,7 @@ import type {
   ExcalidrawLinearElement,
   ExcalidrawSelectionElement,
   ExcalidrawTextElement,
+  ExcalidrawTextElementWithContainer,
   FileId,
   FillStyle,
   FixedPointBinding,
@@ -185,12 +188,16 @@ const handleOversizedLinearElements = <T extends ExcalidrawLinearElement>(
 const isPlainObject = (value: unknown): value is Record<string, unknown> =>
   !!value && typeof value === "object" && !Array.isArray(value);
 
+// the whole string must be the number, so that e.g. dates or lists of numbers
+// aren't truncated to their leading number
+const NUMERIC_STRING_RE = /^\s*[-+]?(\d+\.?\d*|\.\d+)(e[-+]?\d+)?(px)?\s*$/i;
+
 /** Also accepts numeric strings (e.g. `"20"` or `"20px"`). */
 const toFiniteNumber = (value: unknown): number | null => {
   if (isFiniteNumber(value)) {
     return value;
   }
-  if (typeof value === "string") {
+  if (typeof value === "string" && NUMERIC_STRING_RE.test(value)) {
     const parsed = parseFloat(value);
     return isFiniteNumber(parsed) ? parsed : null;
   }
@@ -243,10 +250,13 @@ const IMAGE_STATUSES: readonly ExcalidrawImageElement["status"][] = [
   "error",
 ];
 
-/** Accepts `[x, y]` and `{ x, y }` points, the latter used by some generators. */
+/**
+ * Accepts `[x, y]` and `{ x, y }` points, the latter used by some generators.
+ * Always returns a new point, so that the input isn't shared.
+ */
 const restorePoint = (point: unknown): LocalPoint | null => {
   if (isValidPoint(point)) {
-    return point;
+    return pointFrom<LocalPoint>(point[0], point[1]);
   }
   const [x, y] = Array.isArray(point)
     ? point
@@ -265,7 +275,7 @@ const restorePoints = (points: unknown): LocalPoint[] =>
     ? points.reduce<LocalPoint[]>((acc, point) => {
         const restoredPoint = restorePoint(point);
         if (restoredPoint) {
-          acc.push(pointFrom<LocalPoint>(restoredPoint[0], restoredPoint[1]));
+          acc.push(restoredPoint);
         }
         return acc;
       }, [])
@@ -279,50 +289,25 @@ const restoreLinearElementPoints = (
   points: unknown,
   width: unknown,
   height: unknown,
-): { points: LocalPoint[]; rebuilt: boolean } => {
+): LocalPoint[] => {
   const restoredPoints = restorePoints(points);
 
   if (restoredPoints.length >= 2) {
-    return { points: restoredPoints, rebuilt: false };
+    return restoredPoints;
   }
 
   const [point] = restoredPoints;
   // a lone point other than the origin is the end of the segment
   return point && (point[0] !== 0 || point[1] !== 0)
-    ? { points: [pointFrom<LocalPoint>(0, 0), point], rebuilt: false }
-    : {
-        points: [
-          pointFrom<LocalPoint>(0, 0),
-          pointFrom<LocalPoint>(
-            toFiniteNumber(width) ?? 0,
-            toFiniteNumber(height) ?? 0,
-          ),
-        ],
-        rebuilt: true,
-      };
+    ? [pointFrom<LocalPoint>(0, 0), point]
+    : [
+        pointFrom<LocalPoint>(0, 0),
+        pointFrom<LocalPoint>(
+          toFiniteNumber(width) ?? 0,
+          toFiniteNumber(height) ?? 0,
+        ),
+      ];
 };
-
-/**
- * Linear elements with fewer than 2 points are rebuilt from their size (see
- * `restoreLinearElementPoints`), which leaves nothing to show when they don't
- * have a size either.
- */
-const deleteUnrecoverableLinearElement = <T extends ExcalidrawLinearElement>(
-  element: T,
-  rebuiltPoints: boolean,
-  existingElementsMap: Readonly<ElementsMap> | null | undefined,
-  opts: { deleteInvisibleElements?: boolean } | undefined,
-): T =>
-  opts?.deleteInvisibleElements &&
-  rebuiltPoints &&
-  !element.width &&
-  !element.height &&
-  !element.isDeleted
-    ? bumpVersion(
-        { ...element, isDeleted: true },
-        existingElementsMap?.get(element.id)?.version,
-      )
-    : element;
 
 const restoreFreedrawPoints = (
   points: unknown,
@@ -347,9 +332,7 @@ const restoreFreedrawPoints = (
   points.forEach((point, index) => {
     const restoredPoint = restorePoint(point);
     if (restoredPoint) {
-      restoredPoints.push(
-        pointFrom<LocalPoint>(restoredPoint[0], restoredPoint[1]),
-      );
+      restoredPoints.push(restoredPoint);
       // keep pressures aligned with the points, defaulting the missing or
       // malformed ones, so that a slightly off count doesn't lose them all
       if (pressureValues.length) {
@@ -594,31 +577,40 @@ const repairBinding = <T extends ExcalidrawArrowElement>(
   return null;
 };
 
+const BOUND_ELEMENT_TYPES: ReadonlySet<string> = new Set<BoundElement["type"]>([
+  "arrow",
+  "text",
+]);
+
 /**
- * Accepts `{ id, type }` entries as well as bare ids (as in the legacy
- * `boundElementIds`). Entries with a missing or unknown type are assumed to be
- * arrows, and get their type corrected from the bound element itself once all
- * elements are restored (see `restoreBoundElementTypes`).
+ * Entries with a missing or unknown type are dropped rather than guessed, as
+ * that could e.g. turn a free text into a container's label. The legacy
+ * `boundElementIds` only held arrows, so its bare ids are restored as such.
  */
-const restoreBoundElements = (boundElements: unknown): BoundElement[] => {
-  const entries = Array.isArray(boundElements)
-    ? boundElements
-    : boundElements != null
-    ? [boundElements]
-    : [];
+const restoreBoundElements = (
+  boundElements: unknown,
+  boundElementIds: unknown,
+): BoundElement[] => {
+  const isLegacy = boundElementIds != null;
+  const value = isLegacy ? boundElementIds : boundElements;
+  const entries = Array.isArray(value) ? value : value != null ? [value] : [];
 
   return entries.reduce<BoundElement[]>((acc, entry) => {
-    const id = restoreId(isPlainObject(entry) ? entry.id : entry);
-    if (id) {
-      acc.push({
-        id,
-        type:
-          isPlainObject(entry) &&
-          typeof entry.type === "string" &&
-          entry.type.trim().toLowerCase() === "text"
-            ? "text"
-            : "arrow",
-      });
+    if (isLegacy) {
+      const id = restoreId(entry);
+      if (id) {
+        acc.push({ id, type: "arrow" });
+      }
+      return acc;
+    }
+    if (!isPlainObject(entry)) {
+      return acc;
+    }
+    const id = restoreId(entry.id);
+    const type =
+      typeof entry.type === "string" ? entry.type.trim().toLowerCase() : "";
+    if (id && BOUND_ELEMENT_TYPES.has(type)) {
+      acc.push({ id, type: type as BoundElement["type"] });
     }
     return acc;
   }, []);
@@ -649,10 +641,33 @@ const restorePointBinding = (binding: unknown): FixedPointBinding | null => {
   } as FixedPointBinding;
 };
 
-const restoreArrowhead = (arrowhead: unknown) =>
-  typeof arrowhead === "string"
-    ? normalizeArrowhead(arrowhead as AnyArrowhead)
-    : null;
+// a record so that new arrowheads can't be missed
+const ARROWHEADS_RECORD: Record<Arrowhead, true> = {
+  arrow: true,
+  bar: true,
+  circle: true,
+  circle_outline: true,
+  triangle: true,
+  triangle_outline: true,
+  diamond: true,
+  diamond_outline: true,
+  cardinality_one: true,
+  cardinality_many: true,
+  cardinality_one_or_many: true,
+  cardinality_exactly_one: true,
+  cardinality_zero_or_one: true,
+  cardinality_zero_or_many: true,
+};
+const ARROWHEADS = Object.keys(ARROWHEADS_RECORD) as Arrowhead[];
+
+/** Empty and unknown arrowheads would be drawn as a generic one, so drop them. */
+const restoreArrowhead = (arrowhead: unknown): Arrowhead | null => {
+  const normalized =
+    typeof arrowhead === "string"
+      ? normalizeArrowhead(arrowhead as AnyArrowhead)
+      : null;
+  return normalized && ARROWHEADS.includes(normalized) ? normalized : null;
+};
 
 /**
  * A segment's `index` is that of its end point, so it must be within the
@@ -821,7 +836,8 @@ const restoreElementWithProperties = <
       element.type,
     ),
     boundElements: restoreBoundElements(
-      element.boundElementIds ?? element.boundElements,
+      element.boundElements,
+      element.boundElementIds,
     ),
     updated: toFiniteNumber(element.updated) ?? getUpdatedTimestamp(),
     created: toFiniteNumber(element.created),
@@ -888,11 +904,8 @@ export const restoreElement = (
           : DEFAULT_FONT_FAMILY)) as FontFamilyValues;
       // a label without `text` can still be recovered from its unwrapped
       // `originalText` (rewrapped when refreshing dimensions)
-      const text =
-        restoreString(element.text) ||
-        restoreString(element.originalText) ||
-        "";
-      const height = toFiniteNumber(element.height) ?? 0;
+      const wrappedText = restoreString(element.text);
+      const text = wrappedText || restoreString(element.originalText) || "";
 
       const lineHeight = (toPositiveNumber(element.lineHeight) ??
         restoreLineHeight({
@@ -900,7 +913,9 @@ export const restoreElement = (
           fontSize: restoredFontSize,
           fontFamily: restoredFontFamily,
           text,
-          height,
+          // the height spans the lines of `text` as it was wrapped, so it says
+          // nothing about the line height of the unwrapped `originalText`
+          height: wrappedText ? toFiniteNumber(element.height) ?? 0 : 0,
         })) as ExcalidrawTextElement["lineHeight"];
       element = restoreElementWithProperties(element, {
         fontSize: restoredFontSize,
@@ -929,20 +944,6 @@ export const restoreElement = (
           ? normalizeStickyNoteFontSize(element.baseFontSize)
           : null,
       });
-
-      // the size follows from the text, so measure it if it's missing
-      // (e.g. text created programmatically) rather than keeping it 0x0
-      if (text && !element.width && !element.height) {
-        try {
-          element = {
-            ...element,
-            ...measureText(text, getFontString(element), element.lineHeight),
-          };
-        } catch (error) {
-          // e.g. no canvas to measure with, so keep the element as is
-          console.error("Error measuring text:", error);
-        }
-      }
 
       // if empty text, mark as deleted. We keep in array
       // for data integrity purposes (collab etc.)
@@ -987,12 +988,11 @@ export const restoreElement = (
       const endArrowhead = restoreArrowhead(element.endArrowhead);
       let x = toFiniteNumber(element.x) ?? 0;
       let y = toFiniteNumber(element.y) ?? 0;
-      const restoredPoints = restoreLinearElementPoints(
+      let points = restoreLinearElementPoints(
         element.points,
         element.width,
         element.height,
       );
-      let { points } = restoredPoints;
 
       if (points[0][0] !== 0 || points[0][1] !== 0) {
         ({ points, x, y } =
@@ -1023,14 +1023,7 @@ export const restoreElement = (
         ...getSizeFromPoints(points),
       });
 
-      return handleOversizedLinearElements(
-        deleteUnrecoverableLinearElement(
-          restoredLine,
-          restoredPoints.rebuilt,
-          existingElementsMap,
-          opts,
-        ),
-      );
+      return handleOversizedLinearElements(restoredLine);
     case "arrow": {
       const startArrowhead = restoreArrowhead(element.startArrowhead);
       const endArrowhead =
@@ -1040,39 +1033,18 @@ export const restoreElement = (
       const x = toFiniteNumber(element.x) ?? 0;
       const y = toFiniteNumber(element.y) ?? 0;
       const elbowed = (element as ExcalidrawArrowElement).elbowed === true;
-      const { points, rebuilt: rebuiltPoints } = restoreLinearElementPoints(
+      const points = restoreLinearElementPoints(
         element.points,
         element.width,
         element.height,
       );
       const startBinding = restorePointBinding(element.startBinding);
       const endBinding = restorePointBinding(element.endBinding);
-      const elementWithRestoredPoints = {
-        ...element,
-        points,
-        x,
-        y,
-        elbowed,
-        startBinding,
-        endBinding,
-      } as ExcalidrawArrowElement;
 
       const base = {
         type: element.type,
-        startBinding: repairBinding(
-          elementWithRestoredPoints,
-          startBinding,
-          targetElementsMap,
-          existingElementsMap,
-          "start",
-        ),
-        endBinding: repairBinding(
-          elementWithRestoredPoints,
-          endBinding,
-          targetElementsMap,
-          existingElementsMap,
-          "end",
-        ),
+        startBinding,
+        endBinding,
         startArrowhead,
         endArrowhead,
         points,
@@ -1105,21 +1077,32 @@ export const restoreElement = (
           })
         : restoreElementWithProperties(element as ExcalidrawArrowElement, base);
 
-      const normalizedRestoredElement = {
+      // legacy bindings are migrated from the arrow's geometry, so do it on
+      // the restored arrow rather than on its (possibly malformed) input
+      const arrowWithBindings = {
         ...restoredElement,
-        ...LinearElementEditor.getNormalizeElementPointsAndCoords(
+        startBinding: repairBinding(
           restoredElement,
+          startBinding,
+          targetElementsMap,
+          existingElementsMap,
+          "start",
+        ),
+        endBinding: repairBinding(
+          restoredElement,
+          endBinding,
+          targetElementsMap,
+          existingElementsMap,
+          "end",
         ),
       };
 
-      return handleOversizedLinearElements(
-        deleteUnrecoverableLinearElement(
-          normalizedRestoredElement,
-          rebuiltPoints,
-          existingElementsMap,
-          opts,
+      return handleOversizedLinearElements({
+        ...arrowWithBindings,
+        ...LinearElementEditor.getNormalizeElementPointsAndCoords(
+          arrowWithBindings,
         ),
-      );
+      });
     }
 
     // generic elements
@@ -1154,43 +1137,22 @@ export const restoreElement = (
   return null;
 };
 
-/**
- * Corrects the type of `boundElements` entries (assumed to be arrows when
- * missing or unknown, see `restoreBoundElements`) from the bound elements
- * themselves, which `getBoundTextElement` and others rely on.
- *
- * NOTE mutates elements.
- */
-const restoreBoundElementTypes = (elements: readonly ExcalidrawElement[]) => {
-  const elementsMap = arrayToMap(elements);
-  for (const element of elements) {
-    if (!element.boundElements?.length) {
-      continue;
-    }
-    let changed = false;
-    const boundElements = element.boundElements.map((binding) => {
-      const boundElement = elementsMap.get(binding.id);
-      const type = isTextElement(boundElement ?? null)
-        ? "text"
-        : isArrowElement(boundElement)
-        ? "arrow"
-        : binding.type;
-      if (type === binding.type) {
-        return binding;
-      }
-      changed = true;
-      return { ...binding, type };
-    });
-    if (changed) {
-      (element as Mutable<ExcalidrawElement>).boundElements = boundElements;
-    }
-  }
-};
+/** `null` if the element can't be bound to another one */
+const getBoundElementType = (
+  boundElement: ExcalidrawElement | undefined,
+): BoundElement["type"] | null =>
+  isTextElement(boundElement ?? null)
+    ? "text"
+    : isArrowElement(boundElement)
+    ? "arrow"
+    : null;
 
 /**
  * Repairs container element's boundElements array by removing duplicates and
  * fixing containerId of bound elements if not present. Also removes any
- * bound elements that do not exist in the elements array.
+ * bound elements that do not exist in the elements array, or whose type
+ * doesn't match the binding's (a label's binding is re-added from its
+ * `containerId` in `repairBoundElement`).
  *
  * NOTE mutates elements.
  */
@@ -1210,28 +1172,21 @@ const repairContainerElement = (
         binding,
       ) => {
         const boundElement = elementsMap.get(binding.id);
-        if (boundElement && !boundIds.has(binding.id)) {
+        if (
+          boundElement &&
+          !boundIds.has(binding.id) &&
+          getBoundElementType(boundElement) === binding.type
+        ) {
           boundIds.add(binding.id);
 
-          if (boundElement.isDeleted) {
-            return acc;
-          }
-
-          // the binding type may be missing or wrong (see
-          // `restoreBoundElements`), so take it from the bound element
-          const type = isTextElement(boundElement)
-            ? "text"
-            : isArrowElement(boundElement)
-            ? "arrow"
-            : null;
           if (
-            !type ||
-            (type === "text" && !isTextBindableContainer(container))
+            boundElement.isDeleted ||
+            (binding.type === "text" && !isTextBindableContainer(container))
           ) {
             return acc;
           }
 
-          acc.push(type === binding.type ? binding : { ...binding, type });
+          acc.push(binding);
 
           if (
             isTextElement(boundElement) &&
@@ -1239,8 +1194,10 @@ const repairContainerElement = (
             // if defined, lest boundElements is stale
             !boundElement.containerId
           ) {
-            (boundElement as Mutable<typeof boundElement>).containerId =
-              container.id;
+            Object.assign(boundElement, {
+              containerId: container.id,
+              angle: isArrowElement(container) ? 0 : container.angle,
+            });
           }
         }
         return acc;
@@ -1283,7 +1240,10 @@ const repairBoundElement = (
 
   if (
     container.boundElements &&
-    !container.boundElements.find((binding) => binding.id === boundElement.id)
+    // a binding of the wrong type is dropped in `repairContainerElement`
+    !container.boundElements.find(
+      (binding) => binding.id === boundElement.id && binding.type === "text",
+    )
   ) {
     // copy because we're not cloning on restore, and we don't want to mutate upstream
     const boundElements = (
@@ -1322,6 +1282,86 @@ const repairBoundTextElementOrder = (
     : normalizedElements;
 };
 
+/** e.g. text created programmatically, whose size follows from its content */
+const isUnsizedText = (element: ExcalidrawElement | null) =>
+  isTextElement(element) && !!element.text && !element.width && !element.height;
+
+/**
+ * Sizes text elements restored without a size from their content, and all
+ * of them with `refreshDimensions`. Labels are wrapped to and positioned in
+ * their container, and sticky notes are refitted together with their label.
+ *
+ * Runs once bindings are repaired, as the layout follows from them.
+ *
+ * NOTE mutates elements.
+ */
+const restoreTextDimensions = (
+  elements: readonly ExcalidrawElement[],
+  elementsMap: ElementsMap,
+  opts: { refreshDimensions: boolean },
+) => {
+  for (const element of elements) {
+    if (element.isDeleted) {
+      continue;
+    }
+    try {
+      if (isStickyNoteElement(element)) {
+        const textElement = getBoundTextElement(element, elementsMap);
+        if (opts.refreshDimensions || isUnsizedText(textElement)) {
+          const layout = getStickyNoteLayout(element, textElement);
+          Object.assign(element, layout.container);
+          if (textElement && layout.text) {
+            Object.assign(textElement, layout.text);
+          }
+        }
+      } else if (
+        isTextElement(element) &&
+        // refitted together with their note above
+        !isStickyNoteBoundText(element, elementsMap)
+      ) {
+        const containerCandidate = getContainerElement(element, elementsMap);
+        // bindings may not have been repaired
+        const container = isTextBindableContainer(containerCandidate)
+          ? containerCandidate
+          : null;
+        if (isUnsizedText(element)) {
+          // without a width there's nothing to wrap free text to, so it grows
+          // with its content instead
+          Object.assign(element, { autoResize: true });
+          Object.assign(
+            element,
+            refreshTextDimensions(
+              element,
+              container,
+              elementsMap,
+              element.originalText,
+            ),
+          );
+          if (container) {
+            Object.assign(
+              element,
+              computeBoundTextPosition(
+                container,
+                element as ExcalidrawTextElementWithContainer,
+                elementsMap,
+              ),
+            );
+          }
+        } else if (opts.refreshDimensions) {
+          Object.assign(
+            element,
+            refreshTextDimensions(element, container, elementsMap),
+          );
+        }
+      }
+    } catch (error) {
+      // e.g. no canvas to measure with. The restored dimensions are still
+      // usable, so keep the element
+      console.error("Error refreshing text dimensions:", error);
+    }
+  }
+};
+
 /**
  * Remove an element's frameId if its containing frame is non-existent, or
  * not a frame
@@ -1348,12 +1388,12 @@ const repairFrameMembership = (
  *   seeded from `fontSize` when missing, cleared everywhere else
  * - a sticky label's stroke is never transparent (it is the visible text)
  * - a note's stroke — its ink, which the footer paints with — equals its label's
- * - with `refreshDimensions`, the note and its label are refitted together
+ *
+ * The note and its label are refitted in `restoreTextDimensions`.
  */
 const restoreStickyNotes = (
   elements: readonly ExcalidrawElement[],
   elementsMap: ElementsMap,
-  opts: { refreshDimensions: boolean },
 ) => {
   for (const element of elements) {
     if (!isTextElement(element) || element.isDeleted) {
@@ -1380,20 +1420,6 @@ const restoreStickyNotes = (
       }
     } else if (element.baseFontSize != null) {
       Object.assign(element, { baseFontSize: null });
-    }
-  }
-
-  if (opts.refreshDimensions) {
-    for (const element of elements) {
-      if (!isStickyNoteElement(element) || element.isDeleted) {
-        continue;
-      }
-      const textElement = getBoundTextElement(element, elementsMap);
-      const layout = getStickyNoteLayout(element, textElement);
-      Object.assign(element, layout.container);
-      if (textElement && layout.text) {
-        Object.assign(textElement, layout.text);
-      }
     }
   }
 };
@@ -1463,6 +1489,30 @@ const restoreElementType = (
   return null;
 };
 
+const isInvisibleElement = (
+  restoredElement: ExcalidrawElement,
+  sourceElement: ExcalidrawElement,
+) => {
+  // text is sized from its content once all elements are restored (see
+  // `restoreTextDimensions`)
+  if (isTextElement(restoredElement) && restoredElement.text) {
+    return false;
+  }
+  // linear elements with fewer than 2 points are rebuilt from their size
+  // (see `restoreLinearElementPoints`), which leaves nothing to show when they
+  // don't have a size either
+  if (
+    isLinearElement(restoredElement) &&
+    !restoredElement.width &&
+    !restoredElement.height &&
+    restorePoints((sourceElement as Partial<ExcalidrawLinearElement>).points)
+      .length < 2
+  ) {
+    return true;
+  }
+  return isInvisiblySmallElement(restoredElement);
+};
+
 export const restoreElements = <T extends ExcalidrawElement>(
   targetElements: readonly T[] | undefined | null,
   /** used for additional context (e.g. repairing arrow bindings) */
@@ -1514,16 +1564,27 @@ export const restoreElements = <T extends ExcalidrawElement>(
   // arrows are restored last, so that legacy bindings are migrated against
   // the restored (coerced) geometry of the elements they bind to
   const migratedElements = new Map<T, ExcalidrawElement | null>();
+  // the first element with an id keeps it (duplicates get a random id below),
+  // so references must resolve to that one
+  const claimedIds = new Set<string>();
   for (const element of sourceElements) {
     // filtering out selection, which is legacy, no longer kept in elements,
     // and causing issues if retained
-    if (element.type !== "selection" && element.type !== "arrow") {
-      const migratedElement = migrateElement(element);
-      migratedElements.set(element, migratedElement);
-      const id = restoreId(element.id);
-      if (migratedElement && id) {
-        targetElementsMap.set(id, migratedElement);
+    if (element.type === "selection") {
+      continue;
+    }
+    const id = restoreId(element.id);
+    if (element.type === "arrow") {
+      if (id) {
+        claimedIds.add(id);
       }
+      continue;
+    }
+    const migratedElement = migrateElement(element);
+    migratedElements.set(element, migratedElement);
+    if (migratedElement && id && !claimedIds.has(id)) {
+      claimedIds.add(id);
+      targetElementsMap.set(id, migratedElement);
     }
   }
 
@@ -1540,7 +1601,7 @@ export const restoreElements = <T extends ExcalidrawElement>(
 
         const shouldMarkAsDeleted =
           opts?.deleteInvisibleElements &&
-          isInvisiblySmallElement(migratedElement);
+          isInvisibleElement(migratedElement, element);
 
         if (shouldMarkAsDeleted) {
           migratedElement = bumpVersion(migratedElement, localElement?.version);
@@ -1562,9 +1623,12 @@ export const restoreElements = <T extends ExcalidrawElement>(
     }, [] as ExcalidrawElement[]),
   );
 
-  restoreBoundElementTypes(restoredElements);
+  const restoredElementsMap = arrayToMap(restoredElements);
 
   if (!opts?.repairBindings) {
+    restoreTextDimensions(restoredElements, restoredElementsMap, {
+      refreshDimensions: false,
+    });
     return restoredElements as CombineBrandsIfNeeded<
       T,
       OrderedExcalidrawElement
@@ -1572,37 +1636,23 @@ export const restoreElements = <T extends ExcalidrawElement>(
   }
 
   // repair binding. Mutates elements.
-  const restoredElementsMap = arrayToMap(restoredElements);
+  // Labels go first, so that invalid `containerId`s are cleared before
+  // containers claim their unbound labels
+  for (const element of restoredElements) {
+    if (isTextElement(element) && element.containerId) {
+      repairBoundElement(element, restoredElementsMap);
+    }
+  }
   for (const element of restoredElements) {
     if (element.frameId) {
       repairFrameMembership(element, restoredElementsMap);
     }
 
-    if (isTextElement(element) && element.containerId) {
-      repairBoundElement(element, restoredElementsMap);
-    } else if (element.boundElements) {
-      repairContainerElement(element, restoredElementsMap);
-    }
-
     if (
-      opts.refreshDimensions &&
-      isTextElement(element) &&
-      // sticky labels are refitted together with their note below
-      !isStickyNoteBoundText(element, restoredElementsMap)
+      element.boundElements &&
+      !(isTextElement(element) && element.containerId)
     ) {
-      try {
-        Object.assign(
-          element,
-          refreshTextDimensions(
-            element,
-            getContainerElement(element, restoredElementsMap),
-            restoredElementsMap,
-          ),
-        );
-      } catch (error) {
-        // the restored dimensions are still usable, so keep the element
-        console.error("Error refreshing text dimensions:", error);
-      }
+      repairContainerElement(element, restoredElementsMap);
     }
 
     if (isLinearElement(element)) {
@@ -1623,7 +1673,8 @@ export const restoreElements = <T extends ExcalidrawElement>(
     }
   }
 
-  restoreStickyNotes(restoredElements, restoredElementsMap, {
+  restoreStickyNotes(restoredElements, restoredElementsMap);
+  restoreTextDimensions(restoredElements, restoredElementsMap, {
     refreshDimensions: !!opts.refreshDimensions,
   });
 
