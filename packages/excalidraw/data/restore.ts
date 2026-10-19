@@ -189,17 +189,22 @@ const isPlainObject = (value: unknown): value is Record<string, unknown> =>
   !!value && typeof value === "object" && !Array.isArray(value);
 
 // the whole string must be the number, so that e.g. dates or lists of numbers
-// aren't truncated to their leading number
-const NUMERIC_STRING_RE = /^\s*[-+]?(\d+\.?\d*|\.\d+)(e[-+]?\d+)?(px)?\s*$/i;
+// aren't truncated to their leading number. Each part can only match one way,
+// so that it runs in linear time on untrusted input
+const NUMERIC_STRING_RE =
+  /^[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[-+]?\d+)?(?:px)?$/i;
 
 /** Also accepts numeric strings (e.g. `"20"` or `"20px"`). */
 const toFiniteNumber = (value: unknown): number | null => {
   if (isFiniteNumber(value)) {
     return value;
   }
-  if (typeof value === "string" && NUMERIC_STRING_RE.test(value)) {
-    const parsed = parseFloat(value);
-    return isFiniteNumber(parsed) ? parsed : null;
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (NUMERIC_STRING_RE.test(trimmed)) {
+      const parsed = parseFloat(trimmed);
+      return isFiniteNumber(parsed) ? parsed : null;
+    }
   }
   return null;
 };
